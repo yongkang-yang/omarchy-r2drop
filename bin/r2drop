@@ -323,8 +323,16 @@ ensure_secrets_or_reexec() {
   fi
 
   if [[ "${R2DROP_YKCRED_TRIED:-0}" != "1" ]] && command -v ykcred >/dev/null 2>&1; then
-    export R2DROP_YKCRED_TRIED=1
-    exec ykcred run image-hosting -- "$0" "$@"
+    # ykcred runs the command in a minimal environment. Carry the desktop
+    # session variables (none are secrets) so wl-copy, notify-send and the
+    # shell IPC still reach the session, plus the loop guard.
+    local keep=(R2DROP_YKCRED_TRIED=1) var
+    for var in XDG_RUNTIME_DIR WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS \
+      HYPRLAND_INSTANCE_SIGNATURE XDG_STATE_HOME OMARCHY_PATH OMASNAP_SCREENSHOT_DIR \
+      CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_R2_BUCKET CLOUDFLARE_R2_PUBLIC_URL R2DROP_FORMAT; do
+      [[ -n "${!var:-}" ]] && keep+=("$var=${!var}")
+    done
+    exec ykcred run image-hosting -- env "${keep[@]}" "$0" "$@"
   fi
 
   local missing=()
