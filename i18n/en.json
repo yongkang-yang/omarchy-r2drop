@@ -1,0 +1,17 @@
+{
+  "r2drop.title": "R2Drop",
+  "r2drop.tooltip": "R2Drop — Upload images to Cloudflare R2",
+  "r2drop.capture": "Capture",
+  "r2drop.uploadClipboard": "Upload clipboard",
+  "r2drop.pickFiles": "Pick files",
+  "r2drop.recentUploads": "Recent uploads",
+  "r2drop.empty": "No uploads yet",
+  "r2drop.dropHint": "Drop images to upload",
+  "r2drop.justNow": "Just now",
+  "r2drop.minutesAgo": "%1m ago",
+  "r2drop.hoursAgo": "%1h ago",
+  "r2drop.daysAgo": "%1d ago",
+  "r2drop.monthsAgo": "%1mo ago",
+  "r2drop.yearsAgo": "%1y ago",
+  "r2drop.untitled": "Untitled"
+}

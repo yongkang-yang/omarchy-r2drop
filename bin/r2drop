@@ -1,0 +1,869 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# r2drop — Upload screenshots and images to Cloudflare R2 and copy the link.
+
+set -euo pipefail
+
+config_file_path() {
+  printf '%s/r2drop/config.env' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+history_file_path() {
+  printf '%s/r2drop/history.jsonl' "${XDG_STATE_HOME:-$HOME/.local/state}"
+}
+
+thumbs_dir_path() {
+  printf '%s/r2drop/thumbs' "${XDG_CACHE_HOME:-$HOME/.cache}"
+}
+
+notify_info() {
+  local title="$1"
+  local body="${2:-}"
+  local icon="${3:-}"
+  if [[ "${R2DROP_NO_NOTIFY:-0}" == "1" ]] || ! command -v notify-send >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ -n "$icon" && -f "$icon" ]]; then
+    notify-send -a R2Drop -i "$icon" "$title" "$body" >/dev/null 2>&1 || true
+  else
+    notify-send -a R2Drop "$title" "$body" >/dev/null 2>&1 || true
+  fi
+}
+
+notify_error() {
+  local title="$1"
+  local body="${2:-}"
+  if [[ "${R2DROP_NO_NOTIFY:-0}" == "1" ]] || ! command -v notify-send >/dev/null 2>&1; then
+    return 0
+  fi
+  notify-send -a R2Drop -u critical "$title" "$body" >/dev/null 2>&1 || true
+}
+
+refresh_bar_widget() {
+  if [[ "${R2DROP_NO_IPC:-0}" == "1" ]]; then
+    return 0
+  fi
+  if command -v omarchy-shell >/dev/null 2>&1; then
+    omarchy-shell -q ykyan.r2drop refresh >/dev/null 2>&1 || true
+  fi
+}
+
+# Lowercase ASCII alnum words joined by single dashes, max 60 chars, trimmed of dashes.
+# Matches ObjectKey.slugify in R2.swift.
+slugify() {
+  local value="${1:-}"
+  local slug
+  slug=$(LC_ALL=C printf '%s' "$value" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -cs 'a-z0-9' '-')
+  slug="${slug#-}"
+  slug="${slug%-}"
+  slug="${slug:0:60}"
+  while [[ "$slug" == *- ]]; do
+    slug="${slug%-}"
+  done
+  printf '%s' "$slug"
+}
+
+random_hash() {
+  local bytes="${1:-3}"
+  od -An -tx1 -N "$bytes" /dev/urandom | tr -d ' \n'
+}
+
+strip_extension() {
+  local base="${1##*/}"
+  if [[ "$base" == ?*.* ]]; then
+    printf '%s' "${base%.*}"
+  else
+    printf '%s' "$base"
+  fi
+}
+
+file_extension() {
+  local base="${1##*/}"
+  if [[ "$base" == ?*.* ]]; then
+    LC_ALL=C printf '%s' "${base##*.}" | LC_ALL=C tr 'A-Z' 'a-z'
+  else
+    printf ''
+  fi
+}
+
+# build_key <original_name> [custom_slug] [hash] [yyyy/mm]
+build_key() {
+  local original_name="$1"
+  local custom_slug="${2:-}"
+  local hash="${3:-}"
+  local ym="${4:-}"
+
+  [[ -n "$hash" ]] || hash=$(random_hash 3)
+  [[ -n "$ym" ]] || ym=$(date +%Y/%m)
+
+  local ext
+  ext=$(file_extension "$original_name")
+  [[ -n "$ext" ]] || ext="png"
+
+  local raw_base
+  if [[ -n "$custom_slug" ]]; then
+    raw_base="$custom_slug"
+  else
+    raw_base=$(strip_extension "$original_name")
+  fi
+
+  local slug
+  slug=$(slugify "$raw_base")
+
+  local name_part
+  if [[ -z "$slug" ]]; then
+    name_part="$hash"
+  else
+    name_part="${slug}-${hash}"
+  fi
+
+  printf '%s/%s.%s' "$ym" "$name_part" "$ext"
+}
+
+content_type_for_ext() {
+  local ext
+  ext=$(LC_ALL=C printf '%s' "${1#.}" | LC_ALL=C tr 'A-Z' 'a-z')
+  case "$ext" in
+    png) printf 'image/png' ;;
+    jpg|jpeg) printf 'image/jpeg' ;;
+    gif) printf 'image/gif' ;;
+    webp) printf 'image/webp' ;;
+    svg) printf 'image/svg+xml' ;;
+    heic) printf 'image/heic' ;;
+    tiff|tif) printf 'image/tiff' ;;
+    bmp) printf 'image/bmp' ;;
+    avif) printf 'image/avif' ;;
+    *) printf 'application/octet-stream' ;;
+  esac
+}
+
+ext_for_mime() {
+  local mime
+  mime=$(LC_ALL=C printf '%s' "${1%%;*}" | LC_ALL=C tr 'A-Z' 'a-z')
+  case "$mime" in
+    image/png) printf 'png' ;;
+    image/jpeg|image/jpg) printf 'jpg' ;;
+    image/gif) printf 'gif' ;;
+    image/webp) printf 'webp' ;;
+    image/svg+xml|image/svg) printf 'svg' ;;
+    image/heic|image/heif) printf 'heic' ;;
+    image/tiff|image/x-tiff) printf 'tiff' ;;
+    image/bmp|image/x-bmp|image/x-ms-bmp) printf 'bmp' ;;
+    image/avif) printf 'avif' ;;
+    image/*) printf 'png' ;;
+    *) return 1 ;;
+  esac
+}
+
+is_image_ext() {
+  local ext
+  ext=$(file_extension "$1")
+  case "$ext" in
+    png|jpg|jpeg|gif|webp|svg|heic|tiff|tif|bmp|avif) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_image_file() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  is_image_ext "$path" || return 1
+  local ext mime
+  ext=$(file_extension "$path")
+  mime=$(file --brief --mime-type -- "$path" 2>/dev/null || true)
+  case "$mime" in
+    image/*) return 0 ;;
+    text/xml|application/xml|text/plain|text/html)
+      [[ "$ext" == "svg" ]] && return 0
+      return 1
+      ;;
+    application/octet-stream)
+      [[ "$ext" == "heic" || "$ext" == "avif" ]] && return 0
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# format_link <format> <url> <filename_or_name>
+format_link() {
+  local fmt="${1:-markdown}"
+  local url="$2"
+  local filename="${3:-}"
+  local name
+  name=$(strip_extension "$filename")
+
+  case "$fmt" in
+    url)
+      printf '%s' "$url"
+      ;;
+    markdown)
+      printf '![](%s)' "$url"
+      ;;
+    html)
+      printf '<img src="%s">' "$url"
+      ;;
+    markdown-filename)
+      printf '![%s](%s)' "$name" "$url"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+public_url() {
+  local base="$1"
+  local key="$2"
+  while [[ "$base" == */ ]]; do
+    base="${base%/}"
+  done
+  printf '%s/%s' "$base" "$key"
+}
+
+uri_to_path() {
+  local uri="${1%$'\r'}"
+  [[ "$uri" == file://* ]] || return 1
+  local encoded="${uri#file://}"
+  if [[ "$encoded" == localhost/* ]]; then
+    encoded="${encoded#localhost}"
+  fi
+  local hex_escaped="${encoded//\\/\\\\}"
+  hex_escaped="${hex_escaped//%/\\x}"
+  printf '%b' "$hex_escaped"
+}
+
+# Safely read known KEY=value pairs without sourcing arbitrary code.
+# Existing environment variables take precedence over values in the file.
+parse_config_file() {
+  local cfg_file="${1:-$(config_file_path)}"
+  [[ -f "$cfg_file" ]] || return 0
+
+  local line key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" =~ ^export[[:space:]]+(.*)$ ]]; then
+      line="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      val="${BASH_REMATCH[2]}"
+      val="${val#"${val%%[![:space:]]*}"}"
+      val="${val%"${val##*[![:space:]]}"}"
+
+      if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+        val="${BASH_REMATCH[1]}"
+      elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+        val="${BASH_REMATCH[1]}"
+      else
+        if [[ "$val" =~ ^([^#]*[^[:space:]])[[:space:]]+#.*$ ]]; then
+          val="${BASH_REMATCH[1]}"
+        elif [[ "$val" =~ ^#.*$ ]]; then
+          val=""
+        fi
+      fi
+
+      case "$key" in
+        CLOUDFLARE_ACCOUNT_ID)
+          [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] || CLOUDFLARE_ACCOUNT_ID="$val"
+          ;;
+        CLOUDFLARE_R2_BUCKET)
+          [[ -n "${CLOUDFLARE_R2_BUCKET:-}" ]] || CLOUDFLARE_R2_BUCKET="$val"
+          ;;
+        CLOUDFLARE_R2_PUBLIC_URL)
+          [[ -n "${CLOUDFLARE_R2_PUBLIC_URL:-}" ]] || CLOUDFLARE_R2_PUBLIC_URL="$val"
+          ;;
+        R2DROP_FORMAT)
+          [[ -n "${R2DROP_FORMAT:-}" ]] || R2DROP_FORMAT="$val"
+          ;;
+        *)
+          ;;
+      esac
+    fi
+  done < "$cfg_file"
+}
+
+load_and_validate_config() {
+  local cfg_file="${1:-$(config_file_path)}"
+  parse_config_file "$cfg_file"
+  R2DROP_FORMAT="${R2DROP_FORMAT:-markdown}"
+
+  local missing=()
+  [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] || missing+=("CLOUDFLARE_ACCOUNT_ID")
+  [[ -n "${CLOUDFLARE_R2_BUCKET:-}" ]] || missing+=("CLOUDFLARE_R2_BUCKET")
+  [[ -n "${CLOUDFLARE_R2_PUBLIC_URL:-}" ]] || missing+=("CLOUDFLARE_R2_PUBLIC_URL")
+
+  if (( ${#missing[@]} > 0 )); then
+    local missing_list
+    missing_list=$(IFS=", "; printf '%s' "${missing[*]}")
+    local msg="Missing required config key(s): ${missing_list} in ${cfg_file}"
+    notify_error "R2Drop configuration missing" "$msg"
+    echo "r2drop: $msg" >&2
+    return 1
+  fi
+
+  case "$R2DROP_FORMAT" in
+    url|markdown|html|markdown-filename) ;;
+    *)
+      local msg="Invalid R2DROP_FORMAT '${R2DROP_FORMAT}' in ${cfg_file} (expected: url, markdown, html, markdown-filename)"
+      notify_error "R2Drop configuration error" "$msg"
+      echo "r2drop: $msg" >&2
+      return 1
+      ;;
+  esac
+}
+
+ensure_secrets_or_reexec() {
+  if [[ -n "${CLOUDFLARE_R2_ACCESS_KEY_ID:-}" && -n "${CLOUDFLARE_R2_SECRET_ACCESS_KEY:-}" ]]; then
+    return 0
+  fi
+
+  if [[ "${R2DROP_YKCRED_TRIED:-0}" != "1" ]] && command -v ykcred >/dev/null 2>&1; then
+    export R2DROP_YKCRED_TRIED=1
+    exec ykcred run image-hosting -- "$0" "$@"
+  fi
+
+  local missing=()
+  [[ -n "${CLOUDFLARE_R2_ACCESS_KEY_ID:-}" ]] || missing+=("CLOUDFLARE_R2_ACCESS_KEY_ID")
+  [[ -n "${CLOUDFLARE_R2_SECRET_ACCESS_KEY:-}" ]] || missing+=("CLOUDFLARE_R2_SECRET_ACCESS_KEY")
+  local missing_list
+  missing_list=$(IFS=", "; printf '%s' "${missing[*]}")
+  local msg="Missing R2 secret(s): ${missing_list}"
+  notify_error "R2Drop credentials missing" "$msg"
+  echo "r2drop: $msg" >&2
+  return 1
+}
+
+thumb_path_for_key() {
+  local key="$1"
+  local thumbs_dir="${2:-$(thumbs_dir_path)}"
+  local safe_key="${key//\//_}"
+  printf '%s/%s.png' "$thumbs_dir" "$safe_key"
+}
+
+generate_thumbnail() {
+  local src_file="$1"
+  local key="$2"
+  local thumbs_dir="${3:-$(thumbs_dir_path)}"
+  mkdir -p "$thumbs_dir"
+  local out_path
+  out_path=$(thumb_path_for_key "$key" "$thumbs_dir")
+  magick "${src_file}[0]" -auto-orient -thumbnail '256x256>' PNG:"$out_path" 2>/dev/null || cp -f "$src_file" "$out_path" 2>/dev/null || true
+  printf '%s' "$out_path"
+}
+
+# Append history entry, trim to last 200 lines, and prune unreferenced thumbnails.
+record_history() {
+  local key="$1"
+  local url="$2"
+  local name="$3"
+  local time_iso="$4"
+  local thumb="$5"
+  local hist_file="${6:-$(history_file_path)}"
+  local thumbs_dir="${7:-$(thumbs_dir_path)}"
+  local max_lines="${8:-200}"
+
+  mkdir -p "$(dirname "$hist_file")"
+  local entry
+  entry=$(jq -cn \
+    --arg key "$key" \
+    --arg url "$url" \
+    --arg name "$name" \
+    --arg time "$time_iso" \
+    --arg thumb "$thumb" \
+    '{key: $key, url: $url, name: $name, time: $time, thumb: $thumb}')
+  printf '%s\n' "$entry" >> "$hist_file"
+
+  local tmp_hist="${hist_file}.tmp.$$"
+  tail -n "$max_lines" "$hist_file" > "$tmp_hist"
+  mv -f "$tmp_hist" "$hist_file"
+
+  prune_thumbnails "$hist_file" "$thumbs_dir"
+}
+
+prune_thumbnails() {
+  local hist_file="${1:-$(history_file_path)}"
+  local thumbs_dir="${2:-$(thumbs_dir_path)}"
+  [[ -d "$thumbs_dir" ]] || return 0
+
+  declare -A keep=()
+  if [[ -f "$hist_file" ]]; then
+    local t
+    while IFS= read -r t; do
+      [[ -n "$t" ]] && keep["$t"]=1
+    done < <(jq -r '.thumb // empty' "$hist_file" 2>/dev/null || true)
+  fi
+
+  local f
+  shopt -s nullglob
+  for f in "$thumbs_dir"/*.png; do
+    if [[ -z "${keep[$f]:-}" ]]; then
+      rm -f "$f"
+    fi
+  done
+  shopt -u nullglob
+}
+
+extract_s3_error() {
+  local body="$1"
+  local code="" message=""
+  if [[ "$body" =~ \<Code\>([^\<]+)\</Code\> ]]; then
+    code="${BASH_REMATCH[1]}"
+  fi
+  if [[ "$body" =~ \<Message\>([^\<]+)\</Message\> ]]; then
+    message="${BASH_REMATCH[1]}"
+  fi
+  if [[ -n "$code" && -n "$message" ]]; then
+    printf '%s — %s' "$code" "$message"
+  elif [[ -n "$code" ]]; then
+    printf '%s' "$code"
+  elif [[ -n "$message" ]]; then
+    printf '%s' "$message"
+  else
+    printf '%s' "$body" | tr '\n' ' ' | head -c 200
+  fi
+}
+
+upload_single_file() {
+  local file="$1"
+  local custom_name="${2:-}"
+
+  local base_filename="${file##*/}"
+  local display_name
+  if [[ -n "$custom_name" ]]; then
+    display_name=$(strip_extension "$custom_name")
+  else
+    display_name=$(strip_extension "$base_filename")
+  fi
+
+  local key
+  key=$(build_key "$base_filename" "$custom_name")
+  local ext
+  ext=$(file_extension "$key")
+  local content_type
+  content_type=$(content_type_for_ext "$ext")
+  local payload_hash
+  payload_hash=$(sha256sum -- "$file" | awk '{print $1}')
+
+  local endpoint="https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com/${CLOUDFLARE_R2_BUCKET}/${key}"
+
+  # Escape backslashes and double-quotes for curl config syntax; pass via stdin so secrets never appear in argv/ps.
+  local esc_ak="${CLOUDFLARE_R2_ACCESS_KEY_ID//\\/\\\\}"
+  esc_ak="${esc_ak//\"/\\\"}"
+  local esc_sk="${CLOUDFLARE_R2_SECRET_ACCESS_KEY//\\/\\\\}"
+  esc_sk="${esc_sk//\"/\\\"}"
+
+  local resp_file
+  resp_file=$(mktemp "${TMPDIR:-/tmp}/r2drop-resp.XXXXXX")
+  local http_code=""
+  local curl_err=""
+  local curl_status=0
+
+  http_code=$(
+    printf 'user = "%s:%s"\n' "$esc_ak" "$esc_sk" | curl \
+      --silent \
+      --show-error \
+      --fail-with-body \
+      --connect-timeout 15 \
+      --max-time 120 \
+      --request PUT \
+      --aws-sigv4 "aws:amz:auto:s3" \
+      --header "Content-Type: ${content_type}" \
+      --header "x-amz-content-sha256: ${payload_hash}" \
+      --upload-file "$file" \
+      --output "$resp_file" \
+      --write-out '%{http_code}' \
+      --config - \
+      "$endpoint" 2>&1
+  ) || curl_status=$?
+
+  if (( curl_status != 0 )); then
+    local body=""
+    [[ -f "$resp_file" ]] && body=$(cat "$resp_file" 2>/dev/null || true)
+    rm -f "$resp_file"
+    local s3_err=""
+    [[ -n "$body" ]] && s3_err=$(extract_s3_error "$body")
+    if [[ -n "$s3_err" ]]; then
+      curl_err="HTTP ${http_code}: ${s3_err}"
+    else
+      curl_err="${http_code:-curl exit $curl_status}"
+    fi
+    notify_error "Upload failed" "$curl_err"
+    echo "r2drop: upload failed for '${base_filename}': ${curl_err}" >&2
+    return 1
+  fi
+  rm -f "$resp_file"
+
+  local url
+  url=$(public_url "$CLOUDFLARE_R2_PUBLIC_URL" "$key")
+  local thumb
+  thumb=$(generate_thumbnail "$file" "$key")
+  local time_iso
+  time_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  record_history "$key" "$url" "$display_name" "$time_iso" "$thumb"
+
+  LAST_UPLOAD_KEY="$key"
+  LAST_UPLOAD_URL="$url"
+  LAST_UPLOAD_NAME="$display_name"
+  LAST_UPLOAD_THUMB="$thumb"
+}
+
+cmd_upload() {
+  local orig_args=("upload" "$@")
+  local custom_name=""
+  local files=()
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --name)
+        if (( $# < 2 )); then
+          echo "r2drop: --name requires a value" >&2
+          exit 1
+        fi
+        custom_name="$2"
+        shift 2
+        ;;
+      --name=*)
+        custom_name="${1#--name=}"
+        shift
+        ;;
+      --)
+        shift
+        while (( $# > 0 )); do
+          files+=("$1")
+          shift
+        done
+        ;;
+      -*)
+        echo "r2drop: unknown upload option: $1" >&2
+        exit 1
+        ;;
+      *)
+        files+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if (( ${#files[@]} == 0 )); then
+    echo "r2drop: upload requires at least one image file" >&2
+    exit 1
+  fi
+
+  local f
+  for f in "${files[@]}"; do
+    if [[ ! -f "$f" ]]; then
+      local msg="File not found: $f"
+      notify_error "Upload failed" "$msg"
+      echo "r2drop: $msg" >&2
+      exit 1
+    fi
+    if ! is_image_file "$f"; then
+      local msg="Rejected non-image file: ${f##*/}"
+      notify_error "Upload rejected" "$msg"
+      echo "r2drop: $msg" >&2
+      exit 1
+    fi
+  done
+
+  load_and_validate_config
+  ensure_secrets_or_reexec "${orig_args[@]}"
+
+  local formatted_links=()
+  local last_url=""
+  local last_thumb=""
+  local name_for_file=""
+
+  for f in "${files[@]}"; do
+    if (( ${#files[@]} == 1 )); then
+      name_for_file="$custom_name"
+    else
+      name_for_file=""
+    fi
+    upload_single_file "$f" "$name_for_file"
+    local link
+    link=$(format_link "$R2DROP_FORMAT" "$LAST_UPLOAD_URL" "$LAST_UPLOAD_NAME")
+    formatted_links+=("$link")
+    last_url="$LAST_UPLOAD_URL"
+    last_thumb="$LAST_UPLOAD_THUMB"
+  done
+
+  local joined
+  joined=$(printf '%s\n' "${formatted_links[@]}")
+  # Strip trailing newline for clipboard
+  joined="${joined%$'\n'}"
+
+  printf '%s' "$joined" | wl-copy
+  printf '%s\n' "$joined"
+
+  notify_info "Link copied" "$last_url" "$last_thumb"
+  refresh_bar_widget
+}
+
+cmd_capture() {
+  local region=""
+  region=$(slurp 2>/dev/null) || exit 0
+  [[ -n "$region" ]] || exit 0
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/r2drop-capture.XXXXXX")
+  trap 'rm -rf "$tmp_dir"' EXIT
+
+  local tmp_png="$tmp_dir/screenshot.png"
+  grim -g "$region" "$tmp_png"
+  "$0" upload --name screenshot "$tmp_png"
+}
+
+cmd_clipboard() {
+  local types
+  types=$(wl-paste --list-types 2>/dev/null || true)
+
+  local chosen_mime=""
+  local line
+  # Prefer image/png if available, otherwise take the first image/* type
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    if [[ "$line" == "image/png" ]]; then
+      chosen_mime="image/png"
+      break
+    elif [[ -z "$chosen_mime" && "$line" == image/* ]]; then
+      chosen_mime="$line"
+    fi
+  done <<< "$types"
+
+  if [[ -n "$chosen_mime" ]]; then
+    local ext
+    ext=$(ext_for_mime "$chosen_mime")
+    local tmp_dir
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/r2drop-clipboard.XXXXXX")
+    trap 'rm -rf "$tmp_dir"' EXIT
+
+    local tmp_img="$tmp_dir/screenshot.${ext}"
+    if ! wl-paste --type "$chosen_mime" > "$tmp_img" 2>/dev/null || [[ ! -s "$tmp_img" ]]; then
+      notify_error "No image on the clipboard" "Clipboard image data was empty."
+      echo "r2drop: No image on the clipboard" >&2
+      exit 1
+    fi
+    "$0" upload --name screenshot "$tmp_img"
+    return 0
+  fi
+
+  if grep -Fqx "text/uri-list" <<< "${types//$'\r'/}"; then
+    local uri_list
+    uri_list=$(wl-paste --type text/uri-list 2>/dev/null || true)
+    local image_paths=()
+    local uri path
+    while IFS= read -r uri || [[ -n "$uri" ]]; do
+      uri="${uri%$'\r'}"
+      [[ -z "$uri" || "$uri" == \#* ]] && continue
+      if path=$(uri_to_path "$uri") && is_image_file "$path"; then
+        image_paths+=("$path")
+      fi
+    done <<< "$uri_list"
+
+    if (( ${#image_paths[@]} > 0 )); then
+      "$0" upload "${image_paths[@]}"
+      return 0
+    fi
+  fi
+
+  notify_error "No image on the clipboard" "Copy an image or image file first."
+  echo "r2drop: No image on the clipboard" >&2
+  exit 1
+}
+
+cmd_pick() {
+  if ! command -v zenity >/dev/null 2>&1; then
+    local msg="zenity is not installed. Install it with: omarchy pkg add zenity"
+    notify_error "Missing zenity" "$msg"
+    echo "r2drop: $msg" >&2
+    exit 1
+  fi
+
+  local selection=""
+  selection=$(zenity --file-selection \
+    --multiple \
+    --separator=$'\n' \
+    --title="Select image(s) to upload to R2" \
+    --file-filter="Images | *.png *.PNG *.jpg *.JPG *.jpeg *.JPEG *.gif *.GIF *.webp *.WEBP *.svg *.SVG *.heic *.HEIC *.tiff *.TIFF *.tif *.TIF *.bmp *.BMP *.avif *.AVIF" \
+    2>/dev/null) || exit 0
+  [[ -n "$selection" ]] || exit 0
+
+  local picked=()
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] && picked+=("$line")
+  done <<< "$selection"
+
+  (( ${#picked[@]} > 0 )) || exit 0
+
+  if (( ${#picked[@]} == 1 )); then
+    local custom_name=""
+    custom_name=$(zenity --entry \
+      --title="R2Drop — Image Name" \
+      --text="Optional name for '${picked[0]##*/}' (leave empty to keep file name):" \
+      --entry-text="" \
+      2>/dev/null) || exit 0
+    if [[ -n "$custom_name" ]]; then
+      "$0" upload --name "$custom_name" "${picked[0]}"
+    else
+      "$0" upload "${picked[0]}"
+    fi
+  else
+    "$0" upload "${picked[@]}"
+  fi
+}
+
+cmd_recent() {
+  local as_json=0
+  local count=20
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --json)
+        as_json=1
+        shift
+        ;;
+      [0-9]*)
+        count="$1"
+        shift
+        ;;
+      *)
+        echo "r2drop: unknown recent argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  local hist_file
+  hist_file=$(history_file_path)
+
+  if [[ ! -f "$hist_file" || ! -s "$hist_file" ]]; then
+    if (( as_json )); then
+      echo "[]"
+    fi
+    return 0
+  fi
+
+  if (( as_json )); then
+    tail -n "$count" "$hist_file" | jq -s 'reverse'
+  else
+    tail -n "$count" "$hist_file" | jq -s 'reverse | .[]' | jq -r '[.time, .key, .name, .url] | @tsv'
+  fi
+}
+
+cmd_copy() {
+  if (( $# < 1 )) || [[ -z "${1:-}" ]]; then
+    echo "Usage: r2drop copy <KEY>" >&2
+    exit 1
+  fi
+  local target_key="$1"
+  local hist_file
+  hist_file=$(history_file_path)
+
+  if [[ ! -f "$hist_file" ]]; then
+    local msg="No upload history found for key: $target_key"
+    notify_error "Copy failed" "$msg"
+    echo "r2drop: $msg" >&2
+    exit 1
+  fi
+
+  local entry
+  entry=$(jq -c --arg k "$target_key" 'select(.key == $k)' "$hist_file" | tail -n 1)
+  if [[ -z "$entry" ]]; then
+    local msg="History entry not found for key: $target_key"
+    notify_error "Copy failed" "$msg"
+    echo "r2drop: $msg" >&2
+    exit 1
+  fi
+
+  parse_config_file
+  R2DROP_FORMAT="${R2DROP_FORMAT:-markdown}"
+
+  local url name thumb
+  url=$(jq -r '.url' <<< "$entry")
+  name=$(jq -r '.name // ""' <<< "$entry")
+  thumb=$(jq -r '.thumb // ""' <<< "$entry")
+  [[ -n "$name" ]] || name=$(strip_extension "$target_key")
+
+  local link
+  if ! link=$(format_link "$R2DROP_FORMAT" "$url" "$name"); then
+    echo "r2drop: invalid R2DROP_FORMAT '$R2DROP_FORMAT'" >&2
+    exit 1
+  fi
+
+  printf '%s' "$link" | wl-copy
+  printf '%s\n' "$link"
+  notify_info "Link copied" "$url" "$thumb"
+}
+
+print_help() {
+  cat <<'EOF'
+Usage: r2drop <command> [options]
+
+Upload screenshots and images to Cloudflare R2 and copy the public link.
+
+Commands:
+  capture                 Select a screen region (slurp + grim) and upload
+  clipboard               Upload image or image file(s) from the Wayland clipboard
+  pick                    Pick image file(s) with zenity and upload
+  upload [--name NAME] FILE...
+                          Upload one or more image files to R2
+  recent [--json] [N]     Show the last N uploads (default: 20), newest first
+  copy KEY                Copy a history entry's link again in R2DROP_FORMAT
+  --help, -h              Show this help message
+
+Configuration:
+  ${XDG_CONFIG_HOME:-~/.config}/r2drop/config.env
+    CLOUDFLARE_ACCOUNT_ID   Cloudflare account ID
+    CLOUDFLARE_R2_BUCKET    R2 bucket name
+    CLOUDFLARE_R2_PUBLIC_URL Public base URL for the bucket
+    R2DROP_FORMAT           url | markdown (default) | html | markdown-filename
+
+Secrets (environment or ykcred 'image-hosting'):
+  CLOUDFLARE_R2_ACCESS_KEY_ID
+  CLOUDFLARE_R2_SECRET_ACCESS_KEY
+EOF
+}
+
+main() {
+  local subcmd="${1:---help}"
+  shift || true
+
+  case "$subcmd" in
+    capture)
+      cmd_capture "$@"
+      ;;
+    clipboard)
+      cmd_clipboard "$@"
+      ;;
+    pick)
+      cmd_pick "$@"
+      ;;
+    upload)
+      cmd_upload "$@"
+      ;;
+    recent)
+      cmd_recent "$@"
+      ;;
+    copy)
+      cmd_copy "$@"
+      ;;
+    --help|-h|help)
+      print_help
+      ;;
+    *)
+      echo "r2drop: unknown command '$subcmd' (see 'r2drop --help')" >&2
+      exit 1
+      ;;
+  esac
+}
+
+if [[ "${R2DROP_LIB:-0}" != "1" ]]; then
+  main "$@"
+fi

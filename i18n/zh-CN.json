@@ -1,0 +1,17 @@
+{
+  "r2drop.title": "R2Drop",
+  "r2drop.tooltip": "R2Drop — 上传图片到 Cloudflare R2",
+  "r2drop.capture": "截图",
+  "r2drop.uploadClipboard": "上传剪贴板",
+  "r2drop.pickFiles": "选择文件",
+  "r2drop.recentUploads": "最近上传",
+  "r2drop.empty": "暂无上传记录",
+  "r2drop.dropHint": "拖放图片即可上传",
+  "r2drop.justNow": "刚刚",
+  "r2drop.minutesAgo": "%1 分钟前",
+  "r2drop.hoursAgo": "%1 小时前",
+  "r2drop.daysAgo": "%1 天前",
+  "r2drop.monthsAgo": "%1 个月前",
+  "r2drop.yearsAgo": "%1 年前",
+  "r2drop.untitled": "未命名"
+}

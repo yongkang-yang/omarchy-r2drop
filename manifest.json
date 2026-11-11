@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "ykyan.r2drop",
+  "name": "R2Drop",
+  "version": "1.0.0",
+  "author": "Yongkang Yang",
+  "license": "MIT",
+  "description": "Upload screenshots and images to Cloudflare R2 and copy the public link.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "R2Drop",
+    "description": "Capture, pick, or drop images to upload to Cloudflare R2 and copy recent links.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
