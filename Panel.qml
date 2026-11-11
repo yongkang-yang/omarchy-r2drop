@@ -631,13 +631,6 @@ Panel {
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      Keys.onBackspacePressed: function(event) {
-        if (!keyCatcher.blocked && root.viewMode === "browse") {
-          root.exitBrowseView()
-          event.accepted = true
-        }
-      }
-
       // Main view
       Flickable {
         id: panelFlick
