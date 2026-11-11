@@ -352,7 +352,7 @@ generate_thumbnail() {
   mkdir -p "$thumbs_dir"
   local out_path
   out_path=$(thumb_path_for_key "$key" "$thumbs_dir")
-  magick "${src_file}[0]" -auto-orient -thumbnail '256x256>' PNG:"$out_path" 2>/dev/null || cp -f "$src_file" "$out_path" 2>/dev/null || true
+  magick "${src_file}[0]" -auto-orient -thumbnail '256x256>' PNG:"$out_path" 2>/dev/null || cp -f -- "$src_file" "$out_path" 2>/dev/null || true
   printf '%s' "$out_path"
 }
 
@@ -447,7 +447,7 @@ upload_single_file() {
   local content_type
   content_type=$(content_type_for_ext "$ext")
   local payload_hash
-  payload_hash=$(sha256sum -- "$file" | awk '{print $1}')
+  payload_hash=$(sha256sum < "$file" | awk '{print $1}')
 
   local endpoint="https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com/${CLOUDFLARE_R2_BUCKET}/${key}"
 
@@ -667,7 +667,7 @@ cmd_clipboard() {
     done <<< "$uri_list"
 
     if (( ${#image_paths[@]} > 0 )); then
-      "$0" upload "${image_paths[@]}"
+      "$0" upload -- "${image_paths[@]}"
       return 0
     fi
   fi
@@ -677,45 +677,112 @@ cmd_clipboard() {
   exit 1
 }
 
-cmd_pick() {
-  if ! command -v zenity >/dev/null 2>&1; then
-    local msg="zenity is not installed. Install it with: omarchy pkg add zenity"
-    notify_error "Missing zenity" "$msg"
-    echo "r2drop: $msg" >&2
-    exit 1
+expand_tilde_path() {
+  local p="${1:-}"
+  if [[ "$p" == "~" ]]; then
+    printf '%s' "$HOME"
+  elif [[ "$p" == "~/"* ]]; then
+    printf '%s/%s' "${HOME%/}" "${p#\~/}"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+resolve_xdg_dir() {
+  local key="$1"
+  local fallback="$2"
+  local dir=""
+  if command -v xdg-user-dir >/dev/null 2>&1; then
+    dir=$(xdg-user-dir "$key" 2>/dev/null || true)
+  fi
+  if [[ -z "$dir" || "$dir" == "$HOME" || "$dir" == "${HOME}/" ]]; then
+    dir="$fallback"
+  fi
+  printf '%s' "$dir"
+}
+
+cmd_images() {
+  local as_json=0
+  local count=60
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --json)
+        as_json=1
+        shift
+        ;;
+      [0-9]*)
+        if [[ ! "$1" =~ ^[0-9]+$ ]]; then
+          echo "r2drop: unknown images argument: $1" >&2
+          exit 1
+        fi
+        count="$1"
+        shift
+        ;;
+      *)
+        echo "r2drop: unknown images argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  local screenshot_dir
+  screenshot_dir=$(expand_tilde_path "${OMASNAP_SCREENSHOT_DIR:-$HOME/Pictures/Screenshots}")
+  local pictures_dir
+  pictures_dir=$(resolve_xdg_dir PICTURES "$HOME/Pictures")
+  local download_dir
+  download_dir=$(resolve_xdg_dir DOWNLOAD "$HOME/Downloads")
+
+  local candidate_dirs=("$screenshot_dir" "$pictures_dir" "$download_dir")
+  local existing_dirs=()
+  declare -A seen_dirs=()
+  local d
+  for d in "${candidate_dirs[@]}"; do
+    [[ -n "$d" && -d "$d" ]] || continue
+    local norm_d="${d%/}"
+    [[ -n "$norm_d" ]] || norm_d="/"
+    if [[ -z "${seen_dirs[$norm_d]:-}" ]]; then
+      seen_dirs["$norm_d"]=1
+      existing_dirs+=("$norm_d")
+    fi
+  done
+
+  if (( ${#existing_dirs[@]} == 0 || count == 0 )); then
+    if (( as_json )); then
+      echo "[]"
+    fi
+    return 0
   fi
 
-  local selection=""
-  selection=$(zenity --file-selection \
-    --multiple \
-    --separator=$'\n' \
-    --title="Select image(s) to upload to R2" \
-    --file-filter="Images | *.png *.PNG *.jpg *.JPG *.jpeg *.JPEG *.gif *.GIF *.webp *.WEBP *.svg *.SVG *.heic *.HEIC *.tiff *.TIFF *.tif *.TIF *.bmp *.BMP *.avif *.AVIF" \
-    2>/dev/null) || exit 0
-  [[ -n "$selection" ]] || exit 0
+  local json_out
+  json_out=$(
+    find "${existing_dirs[@]}" -mindepth 1 -maxdepth 1 -type f \
+      ! -name '.*' \
+      ! -size +50M \
+      \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.avif' -o -iname '*.bmp' \) \
+      -print0 2>/dev/null \
+    | xargs -0 -r stat --printf='%.9Y\0%Y\0%s\0%n\0' -- 2>/dev/null \
+    | jq -Rs --argjson limit "$count" '
+        split("\u0000")
+        | [range(0; length - 1; 4) as $i | {
+            sort_ts: (.[$i] | tonumber),
+            mtime: (.[$i + 1] | tonumber),
+            size: (.[$i + 2] | tonumber),
+            path: .[$i + 3],
+            name: (.[$i + 3] | split("/")[-1])
+          }]
+        | unique_by(.path)
+        | sort_by(.sort_ts, .path)
+        | reverse
+        | .[:$limit]
+        | map({path, name, mtime, size})
+      '
+  )
 
-  local picked=()
-  local line
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -n "$line" ]] && picked+=("$line")
-  done <<< "$selection"
-
-  (( ${#picked[@]} > 0 )) || exit 0
-
-  if (( ${#picked[@]} == 1 )); then
-    local custom_name=""
-    custom_name=$(zenity --entry \
-      --title="R2Drop — Image Name" \
-      --text="Optional name for '${picked[0]##*/}' (leave empty to keep file name):" \
-      --entry-text="" \
-      2>/dev/null) || exit 0
-    if [[ -n "$custom_name" ]]; then
-      "$0" upload --name "$custom_name" "${picked[0]}"
-    else
-      "$0" upload "${picked[0]}"
-    fi
+  if (( as_json )); then
+    printf '%s\n' "${json_out:-[]}"
   else
-    "$0" upload "${picked[@]}"
+    jq -r '.[] | [.mtime, .size, .name, .path] | @tsv' <<< "${json_out:-[]}"
   fi
 }
 
@@ -811,8 +878,8 @@ Upload screenshots and images to Cloudflare R2 and copy the public link.
 Commands:
   capture                 Select a screen region (slurp + grim) and upload
   clipboard               Upload image or image file(s) from the Wayland clipboard
-  pick                    Pick image file(s) with zenity and upload
-  upload [--name NAME] FILE...
+  images [--json] [N]     List the N (default: 60) most recently modified images
+  upload [--name NAME] [--] FILE...
                           Upload one or more image files to R2
   recent [--json] [N]     Show the last N uploads (default: 20), newest first
   copy KEY                Copy a history entry's link again in R2DROP_FORMAT
@@ -842,8 +909,8 @@ main() {
     clipboard)
       cmd_clipboard "$@"
       ;;
-    pick)
-      cmd_pick "$@"
+    images)
+      cmd_images "$@"
       ;;
     upload)
       cmd_upload "$@"

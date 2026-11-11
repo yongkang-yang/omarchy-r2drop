@@ -202,14 +202,18 @@ assert_eq "2026/09/item-205.png" "$recent_first" "recent --json returns newest f
 assert_eq "2026/09/item-203.png" "$recent_third" "recent --json returns newest first (index 2)"
 
 # ---------------------------------------------------------------------------
-# 6. URI decoding, image detection, copy KEY, pick without zenity, upload rejection
+# 6. URI decoding, image detection, copy KEY, upload -- & rejection, images listing
 # ---------------------------------------------------------------------------
-assert_eq "/home/user/My Photo (1).png"   "$(uri_to_path "file:///home/user/My%20Photo%20%281%29.png")"   "uri_to_path decodes percent-encoded file URI"
+assert_eq "/home/user/My Photo (1).png" \
+  "$(uri_to_path "file:///home/user/My%20Photo%20%281%29.png")" \
+  "uri_to_path decodes percent-encoded file URI"
 
 sample_png="${TMP_ROOT}/sample.png"
 sample_txt="${TMP_ROOT}/sample.txt"
+dash_txt="${TMP_ROOT}/-leading-dash.txt"
 magick -size 4x4 xc:red "$sample_png"
 echo "not an image" > "$sample_txt"
+echo "not an image" > "$dash_txt"
 
 assert_true "is_image_file accepts real PNG" is_image_file "$sample_png"
 assert_false "is_image_file rejects plain text file" is_image_file "$sample_txt"
@@ -225,15 +229,96 @@ chmod +x "${mock_bin}/wl-copy"
 export TMP_CLIPBOARD_FILE="${TMP_ROOT}/clipboard.txt"
 
 PATH="${mock_bin}:${PATH}" R2DROP_FORMAT="markdown-filename" cmd_copy "2026/09/item-205.png" >/dev/null
-assert_eq "![item-205](https://img.example.com/2026/09/item-205.png)"   "$(cat "$TMP_CLIPBOARD_FILE")"   "cmd_copy copies formatted link for key"
+assert_eq "![item-205](https://img.example.com/2026/09/item-205.png)" \
+  "$(cat "$TMP_CLIPBOARD_FILE")" \
+  "cmd_copy copies formatted link for key"
 
-# Non-image rejection via CLI
-reject_err=$("${REPO_DIR}/bin/r2drop" upload "$sample_txt" 2>&1 || true)
-assert_true "upload rejects non-image file"   bash -c '[[ "$1" == *"Rejected non-image file"* ]]' _ "$reject_err"
+# Non-image rejection via CLI (including -- before a dash-prefixed path)
+reject_err=$("${REPO_DIR}/bin/r2drop" upload -- "$dash_txt" 2>&1 || true)
+assert_true "upload accepts -- and rejects non-image file" \
+  bash -c '[[ "$1" == *"Rejected non-image file: -leading-dash.txt"* ]]' _ "$reject_err"
 
-# zenity missing message when running pick without zenity on PATH
-pick_err=$(PATH="/usr/bin:/bin" "${REPO_DIR}/bin/r2drop" pick 2>&1 || true)
-assert_true "pick suggests omarchy pkg add zenity when missing"   bash -c '[[ "$1" == *"omarchy pkg add zenity"* ]]' _ "$pick_err"
+# ---------------------------------------------------------------------------
+# 7. r2drop images [--json] [N] tests
+# ---------------------------------------------------------------------------
+fake_home="${TMP_ROOT}/home"
+fake_cfg="${fake_home}/.config"
+shots_dir="${TMP_ROOT}/custom-screenshots"
+pics_dir="${fake_home}/Pictures"
+dl_dir="${fake_home}/Downloads"
+sub_dir="${pics_dir}/nested"
+mkdir -p "$fake_cfg" "$shots_dir" "$pics_dir" "$sub_dir"
+# Note: dl_dir intentionally does not exist yet to verify missing dirs are skipped cleanly.
+
+# Configure user-dirs.dirs for xdg-user-dir
+cat > "${fake_cfg}/user-dirs.dirs" <<'EOF'
+XDG_PICTURES_DIR="$HOME/Pictures"
+XDG_DOWNLOAD_DIR="$HOME/Downloads"
+EOF
+
+img_old="${pics_dir}/old_photo.JPG"
+img_space="${shots_dir}/screen shot with spaces (1).png"
+img_newline="${pics_dir}/line"$'\n'"break.webp"
+img_avif="${shots_dir}/modern.avif"
+img_hidden="${shots_dir}/.hidden_shot.png"
+img_nested="${sub_dir}/nested_should_skip.png"
+img_nonimg="${pics_dir}/notes.txt"
+img_huge="${shots_dir}/too_big.bmp"
+
+printf '1234' > "$img_old"
+printf '123456' > "$img_space"
+printf '12345678' > "$img_newline"
+printf '12' > "$img_avif"
+printf 'hidden' > "$img_hidden"
+printf 'nested' > "$img_nested"
+printf 'text' > "$img_nonimg"
+truncate -s 55M "$img_huge"
+
+touch -d "2026-02-01 10:00:00Z" "$img_old"
+touch -d "2026-02-01 11:00:00Z" "$img_avif"
+touch -d "2026-02-01 12:00:00Z" "$img_space"
+touch -d "2026-02-01 13:00:00Z" "$img_newline"
+touch -d "2026-02-01 14:00:00Z" "$img_hidden"
+touch -d "2026-02-01 15:00:00Z" "$img_nested"
+touch -d "2026-02-01 16:00:00Z" "$img_nonimg"
+touch -d "2026-02-01 17:00:00Z" "$img_huge"
+
+images_json=$(
+  HOME="$fake_home" \
+  XDG_CONFIG_HOME="$fake_cfg" \
+  OMASNAP_SCREENSHOT_DIR="$shots_dir" \
+  "${REPO_DIR}/bin/r2drop" images --json
+)
+
+assert_eq "4" "$(jq 'length' <<< "$images_json")" \
+  "images --json skips hidden, >50MB, non-image, nested, and missing dirs"
+
+assert_eq "$img_newline" "$(jq -r '.[0].path' <<< "$images_json")" \
+  "images --json sorts newest first (index 0 has newline in filename)"
+assert_eq $'line\nbreak.webp' "$(jq -r '.[0].name' <<< "$images_json")" \
+  "images --json preserves newline in name"
+assert_eq "8" "$(jq -r '.[0].size' <<< "$images_json")" \
+  "images --json reports byte size"
+
+assert_eq "$img_space" "$(jq -r '.[1].path' <<< "$images_json")" \
+  "images --json preserves spaces in path (index 1)"
+assert_eq "screen shot with spaces (1).png" "$(jq -r '.[1].name' <<< "$images_json")" \
+  "images --json preserves spaces in name (index 1)"
+assert_eq "6" "$(jq -r '.[1].size' <<< "$images_json")" \
+  "images --json reports size for spaced filename"
+
+assert_eq "$img_avif" "$(jq -r '.[2].path' <<< "$images_json")" \
+  "images --json includes avif (index 2)"
+assert_eq "$img_old" "$(jq -r '.[3].path' <<< "$images_json")" \
+  "images --json includes uppercase JPG oldest last (index 3)"
+
+images_top2=$(
+  HOME="$fake_home" \
+  XDG_CONFIG_HOME="$fake_cfg" \
+  OMASNAP_SCREENSHOT_DIR="$shots_dir" \
+  "${REPO_DIR}/bin/r2drop" images --json 2
+)
+assert_eq "2" "$(jq 'length' <<< "$images_top2")" "images --json N limits output count"
 
 echo "All ${PASS} assertions passed (${FAIL} failed)."
 (( FAIL == 0 ))

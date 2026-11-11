@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "R2Drop",
-    "description": "Capture, pick, or drop images to upload to Cloudflare R2 and copy recent links.",
+    "description": "Capture, browse, or drop images to upload to Cloudflare R2 and copy recent links.",
     "category": "Files",
     "allowMultiple": false,
     "defaultSection": "right"

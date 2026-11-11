@@ -22,12 +22,6 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable ykyan.r2drop
 ```
 
-Optional file picker dependency (for `r2drop pick`):
-
-```bash
-omarchy pkg add zenity
-```
-
 ## Configuration
 
 Edit `~/.config/r2drop/config.env` (created by `./install.sh` from `config.env.example`):
@@ -60,15 +54,15 @@ Add to `~/.config/hypr/bindings.lua`:
 ```lua
 o.bind("SUPER + SHIFT + S", "Capture & upload to R2", "r2drop capture")
 o.bind("SUPER + SHIFT + U", "Upload clipboard image to R2", "r2drop clipboard")
-o.bind("SUPER + SHIFT + O", "Pick & upload image to R2", "r2drop pick")
+o.bind("SUPER + SHIFT + O", "Toggle R2Drop panel", "omarchy-shell ykyan.r2drop toggle")
 ```
 
 ## Commands
 
 - `r2drop capture` — select a screen region (`slurp` + `grim`), upload to R2, and copy the link.
 - `r2drop clipboard` — upload an `image/*` or `file://` image URI list from the Wayland clipboard and replace the clipboard with the link(s).
-- `r2drop pick` — pick one or more images via `zenity` (with an optional custom name for a single file) and upload.
-- `r2drop upload [--name NAME] FILE...` — upload one or more image files directly.
+- `r2drop images [--json] [N]` — list the `N` (default 60) most recently modified image files from Screenshots, Pictures, and Downloads.
+- `r2drop upload [--name NAME] [--] FILE...` — upload one or more image files directly.
 - `r2drop recent [--json] [N]` — list the last `N` (default 20) uploads, newest first.
 - `r2drop copy KEY` — re-copy a history entry's link in `R2DROP_FORMAT`.
 - `omarchy-shell ykyan.r2drop refresh` — refresh the bar widget's recent uploads list over shell IPC.

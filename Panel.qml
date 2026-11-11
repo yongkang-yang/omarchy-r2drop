@@ -24,12 +24,22 @@ Panel {
 
   readonly property Item panelFlick: panel.loadedContent ? panel.loadedContent.panelFlick : null
   readonly property Item recentColumn: panel.loadedContent ? panel.loadedContent.recentColumn : null
+  readonly property Item browseFlick: panel.loadedContent ? panel.loadedContent.browseFlick : null
+  readonly property Item browseGrid: panel.loadedContent ? panel.loadedContent.browseGrid : null
+  readonly property Item nameField: panel.loadedContent ? panel.loadedContent.nameField : null
 
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  property string viewMode: "main"
   property var recentItems: []
+  property var browseItems: []
+  property var selectedPaths: []
+  property string customName: ""
+  property int browseIndex: 0
+  readonly property int gridColumns: 3
+
   property string focusSection: "recent"
   property int selectedIndex: 0
   property int actionIndex: 0
@@ -37,6 +47,7 @@ Panel {
   property int nowTick: 0
   property string _whichOut: ""
   property string _recentOut: ""
+  property string _imagesOut: ""
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -48,12 +59,18 @@ Panel {
 
   onOpenedChanged: {
     if (opened) {
+      viewMode = "main"
+      selectedPaths = []
+      customName = ""
+      if (nameField) nameField.text = ""
       cursorActive = false
       focusSection = recentItems.length > 0 ? "recent" : "actions"
       selectedIndex = 0
       actionIndex = 0
+      browseIndex = 0
       nowTick += 1
       if (panelFlick) panelFlick.contentY = 0
+      if (browseFlick) browseFlick.contentY = 0
       refresh()
       Qt.callLater(function() {
         if (panel.loadedContent) panel.loadedContent.forceActiveFocus()
@@ -62,6 +79,7 @@ Panel {
   }
 
   onSelectedIndexChanged: scrollCursorIntoView()
+  onBrowseIndexChanged: scrollBrowseCursorIntoView()
 
   function resolveBinary() {
     if (whichProcess.running) return
@@ -76,6 +94,40 @@ Panel {
     root._recentOut = ""
     recentProcess.command = [root.r2dropBin, "recent", "--json", "12"]
     recentProcess.running = true
+  }
+
+  function loadBrowseImages() {
+    if (pathBin === "" && !whichProcess.running) resolveBinary()
+    if (imagesProcess.running) return
+    root._imagesOut = ""
+    imagesProcess.command = [root.r2dropBin, "images", "--json", "60"]
+    imagesProcess.running = true
+  }
+
+  function enterBrowseView() {
+    root.viewMode = "browse"
+    root.selectedPaths = []
+    root.customName = ""
+    if (nameField) nameField.text = ""
+    root.browseIndex = 0
+    root.cursorActive = true
+    if (browseFlick) browseFlick.contentY = 0
+    root.loadBrowseImages()
+    Qt.callLater(function() {
+      if (panel.loadedContent) panel.loadedContent.forceActiveFocus()
+    })
+  }
+
+  function exitBrowseView() {
+    root.viewMode = "main"
+    root.selectedPaths = []
+    root.customName = ""
+    if (nameField) nameField.text = ""
+    root.focusSection = "actions"
+    root.actionIndex = 2
+    Qt.callLater(function() {
+      if (panel.loadedContent) panel.loadedContent.forceActiveFocus()
+    })
   }
 
   function boundedString(value, maxLen) {
@@ -120,6 +172,42 @@ Panel {
     root.ensureCursor()
   }
 
+  function applyImagesJson(raw) {
+    var text = String(raw || "").trim()
+    if (text === "") {
+      root.browseItems = []
+      root.ensureBrowseCursor()
+      return
+    }
+    try {
+      var parsed = JSON.parse(text)
+      if (!Array.isArray(parsed)) {
+        root.browseItems = []
+        root.ensureBrowseCursor()
+        return
+      }
+      var items = []
+      var limit = Math.min(60, parsed.length)
+      for (var i = 0; i < limit; i++) {
+        var entry = parsed[i]
+        if (!entry || typeof entry !== "object") continue
+        var path = boundedString(entry.path, 4096)
+        if (path === "") continue
+        var name = boundedString(entry.name || path.split("/").pop(), 512)
+        items.push({
+          path: path,
+          name: name,
+          mtime: Number(entry.mtime) || 0,
+          size: Number(entry.size) || 0
+        })
+      }
+      root.browseItems = items
+    } catch (e) {
+      root.browseItems = []
+    }
+    root.ensureBrowseCursor()
+  }
+
   function ensureCursor() {
     if (root.recentItems.length === 0) {
       root.focusSection = "actions"
@@ -133,7 +221,76 @@ Panel {
     if (root.actionIndex < 0 || root.actionIndex > 2) root.actionIndex = 0
   }
 
+  function ensureBrowseCursor() {
+    if (root.browseItems.length === 0) {
+      root.browseIndex = 0
+    } else {
+      if (root.browseIndex >= root.browseItems.length) {
+        root.browseIndex = Math.max(0, root.browseItems.length - 1)
+      }
+      if (root.browseIndex < 0) root.browseIndex = 0
+    }
+  }
+
+  function isPathSelected(path) {
+    return root.selectedPaths.indexOf(String(path || "")) !== -1
+  }
+
+  function toggleSelectPath(path) {
+    var p = String(path || "")
+    if (p === "") return
+    var next = root.selectedPaths.slice()
+    var idx = next.indexOf(p)
+    if (idx >= 0) next.splice(idx, 1)
+    else next.push(p)
+    root.selectedPaths = next
+    if (next.length !== 1) {
+      root.customName = ""
+      if (nameField) nameField.text = ""
+      if (panel.loadedContent) panel.loadedContent.forceActiveFocus()
+    }
+  }
+
+  function toggleBrowseFocused() {
+    root.cursorActive = true
+    root.ensureBrowseCursor()
+    if (root.browseItems.length === 0) return
+    var item = root.browseItems[root.browseIndex]
+    if (item && item.path) root.toggleSelectPath(item.path)
+  }
+
+  function moveBrowseCursor(dx, dy) {
+    root.ensureBrowseCursor()
+    if (root.browseItems.length === 0) return
+    if (!root.cursorActive) {
+      root.cursorActive = true
+      root.scrollBrowseCursorIntoView()
+      return
+    }
+    var count = root.browseItems.length
+    var next = root.browseIndex
+    if (dx !== 0) {
+      next = Math.max(0, Math.min(count - 1, next + (dx > 0 ? 1 : -1)))
+    } else if (dy !== 0) {
+      var step = (dy > 0 ? 1 : -1) * root.gridColumns
+      var candidate = next + step
+      if (candidate >= 0 && candidate < count) {
+        next = candidate
+      } else if (dy > 0) {
+        var currentRow = Math.floor(next / root.gridColumns)
+        var lastRow = Math.floor((count - 1) / root.gridColumns)
+        if (currentRow < lastRow) next = count - 1
+      }
+    }
+    root.browseIndex = next
+  }
+
   function moveCursor(dx, dy) {
+    if (root.viewMode === "browse") {
+      root.moveBrowseCursor(dx, dy)
+      return
+    }
+
     if (!root.cursorActive) {
       root.cursorActive = true
       if (dx !== 0 || root.recentItems.length === 0) {
@@ -184,7 +341,7 @@ Panel {
     if (root.focusSection === "actions") {
       if (root.actionIndex === 0) root.runCapture()
       else if (root.actionIndex === 1) root.runClipboard()
-      else root.runPick()
+      else root.enterBrowseView()
       return
     }
     if (root.focusSection === "recent" && root.recentItems.length > 0) {
@@ -193,25 +350,31 @@ Panel {
     }
   }
 
-  function scrollItemIntoView(item) {
-    if (!panelFlick || !item) return
+  function scrollFlickItemIntoView(flick, item) {
+    if (!flick || !item) return
     Qt.callLater(function() {
-      if (!item || !panelFlick) return
+      if (!item || !flick) return
       var margin = Style.space(6)
-      var point = item.mapToItem(panelFlick.contentItem, 0, 0)
+      var point = item.mapToItem(flick.contentItem, 0, 0)
       var top = point.y
       var bottom = top + item.height
-      var viewTop = panelFlick.contentY
-      var viewBottom = viewTop + panelFlick.height
-      var maxY = Math.max(0, panelFlick.contentHeight - panelFlick.height)
-      if (top < viewTop + margin) panelFlick.contentY = Math.max(0, top - margin)
-      else if (bottom > viewBottom - margin) panelFlick.contentY = Math.min(maxY, bottom + margin - panelFlick.height)
+      var viewTop = flick.contentY
+      var viewBottom = viewTop + flick.height
+      var maxY = Math.max(0, flick.contentHeight - flick.height)
+      if (top < viewTop + margin) flick.contentY = Math.max(0, top - margin)
+      else if (bottom > viewBottom - margin) flick.contentY = Math.min(maxY, bottom + margin - flick.height)
     })
   }
 
   function scrollCursorIntoView() {
-    if (focusSection === "recent" && recentColumn && selectedIndex >= 0 && selectedIndex < recentColumn.children.length) {
-      scrollItemIntoView(recentColumn.children[selectedIndex])
+    if (viewMode === "main" && focusSection === "recent" && recentColumn && selectedIndex >= 0 && selectedIndex < recentColumn.children.length) {
+      scrollFlickItemIntoView(panelFlick, recentColumn.children[selectedIndex])
+    }
+  }
+
+  function scrollBrowseCursorIntoView() {
+    if (viewMode === "browse" && browseGrid && browseIndex >= 0 && browseIndex < browseGrid.children.length) {
+      scrollFlickItemIntoView(browseFlick, browseGrid.children[browseIndex])
     }
   }
 
@@ -229,11 +392,6 @@ Panel {
     root.runDetached(["clipboard"])
   }
 
-  function runPick() {
-    root.close()
-    root.runDetached(["pick"])
-  }
-
   function copyKey(key) {
     var k = String(key || "")
     if (k === "") return
@@ -241,10 +399,31 @@ Panel {
     root.runDetached(["copy", k])
   }
 
-  function uploadFiles(paths) {
+  function uploadFiles(paths, nameOpt) {
     if (!paths || paths.length === 0) return
+    var args = ["upload"]
+    var trimmedName = String(nameOpt || "").trim()
+    if (paths.length === 1 && trimmedName !== "") {
+      args.push("--name", trimmedName)
+    }
+    args.push("--")
+    args = args.concat(paths)
     root.close()
-    root.runDetached(["upload"].concat(paths))
+    root.runDetached(args)
+  }
+
+  function uploadBrowse(allowFocusedFallback) {
+    var paths = []
+    if (root.selectedPaths.length > 0) {
+      paths = root.selectedPaths.slice()
+    } else if (allowFocusedFallback && root.browseItems.length > 0) {
+      root.ensureBrowseCursor()
+      var focused = root.browseItems[root.browseIndex]
+      if (focused && focused.path) paths = [focused.path]
+    }
+    if (paths.length === 0) return
+    var custom = paths.length === 1 && nameField ? nameField.text : root.customName
+    root.uploadFiles(paths, custom)
   }
 
   function decodeFileUri(uriStr) {
@@ -344,6 +523,21 @@ Panel {
     }
   }
 
+  Process {
+    id: imagesProcess
+    running: false
+    command: []
+    stdout: StdioCollector {
+      id: imagesStdout
+      waitForEnd: true
+      onStreamFinished: root._imagesOut = text
+    }
+    onExited: function(exitCode) {
+      var out = String(imagesStdout.text || root._imagesOut || "")
+      if (exitCode === 0) root.applyImagesJson(out)
+    }
+  }
+
   ShellIpc {
     target: root.ipcTarget
     function open(): void { root.open() }
@@ -389,7 +583,7 @@ Panel {
       var paths = root.extractDropPaths(drop)
       if (paths.length > 0) {
         drop.acceptProposedAction()
-        root.uploadFiles(paths)
+        root.uploadFiles(paths, "")
       }
     }
   }
@@ -401,28 +595,56 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: panel.loadedContent
-    contentWidth: panel.fittedContentWidth(Style.space(360))
-    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(520))
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(540))
 
     content: PanelKeyCatcher {
       id: keyCatcher
       property alias panelFlick: panelFlick
       property alias recentColumn: recentColumn
-      implicitHeight: column.implicitHeight
+      property alias browseFlick: browseFlick
+      property alias browseGrid: browseGrid
+      property alias nameField: nameField
+      property bool returnHandled: false
+
+      implicitHeight: root.viewMode === "browse" ? browseViewColumn.implicitHeight : mainColumn.implicitHeight
       anchors.fill: parent
+      blocked: nameField.activeFocus
 
       onMoveRequested: function(dx, dy) {
         root.moveCursor(dx, dy)
       }
-      onActivateRequested: root.activateCursor()
-      onCloseRequested: root.close()
+      onReturnRequested: returnHandled = true
+      onActivateRequested: {
+        var fromReturn = returnHandled
+        returnHandled = false
+        if (root.viewMode === "browse") {
+          if (fromReturn) root.uploadBrowse(true)
+          else root.toggleBrowseFocused()
+        } else {
+          root.activateCursor()
+        }
+      }
+      onCloseRequested: {
+        if (root.viewMode === "browse") root.exitBrowseView()
+        else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
+      Keys.onBackspacePressed: function(event) {
+        if (!keyCatcher.blocked && root.viewMode === "browse") {
+          root.exitBrowseView()
+          event.accepted = true
+        }
+      }
+
+      // Main view
       Flickable {
         id: panelFlick
+        visible: root.viewMode === "main"
         anchors.fill: parent
         contentWidth: width
-        contentHeight: column.implicitHeight
+        contentHeight: mainColumn.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
@@ -430,7 +652,7 @@ Panel {
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
         Column {
-          id: column
+          id: mainColumn
           width: panelFlick.width
           spacing: Style.space(10)
 
@@ -482,7 +704,7 @@ Panel {
               width: actionRow.cellWidth
               bordered: true
               iconText: "󰉋"
-              text: strings.t("r2drop.pickFiles")
+              text: strings.t("r2drop.browse")
               fontSize: Style.font.bodySmall
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -494,7 +716,7 @@ Panel {
                   root.actionIndex = 2
                 }
               }
-              onClicked: root.runPick()
+              onClicked: root.enterBrowseView()
             }
           }
 
@@ -541,6 +763,126 @@ Panel {
         }
       }
 
+      // Browse view
+      Column {
+        id: browseViewColumn
+        visible: root.viewMode === "browse"
+        width: parent.width
+        spacing: Style.space(8)
+
+        RowLayout {
+          width: parent.width
+          spacing: Style.space(8)
+
+          Button {
+            bordered: true
+            iconText: Commons.I18n.rightToLeft ? "󰁔" : "󰁍"
+            text: strings.t("r2drop.back")
+            fontSize: Style.font.bodySmall
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.exitBrowseView()
+          }
+
+          PlainText {
+            Layout.fillWidth: true
+            text: strings.t("r2drop.browseTitle")
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            elide: Text.ElideRight
+          }
+        }
+
+        PanelSeparator {
+          foreground: root.foreground
+        }
+
+        PlainText {
+          visible: root.browseItems.length === 0
+          width: parent.width
+          topPadding: Style.space(16)
+          bottomPadding: Style.space(16)
+          text: strings.t("r2drop.browseEmpty")
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          horizontalAlignment: Text.AlignHCenter
+        }
+
+        Flickable {
+          id: browseFlick
+          visible: root.browseItems.length > 0
+          width: parent.width
+          height: Math.min(browseGrid.implicitHeight, Style.space(320))
+          contentWidth: width
+          contentHeight: browseGrid.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          flickableDirection: Flickable.VerticalFlick
+          interactive: contentHeight > height
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+          Grid {
+            id: browseGrid
+            width: browseFlick.width
+            columns: root.gridColumns
+            spacing: Style.space(6)
+            readonly property real cellWidth: Math.max(Style.space(60), Math.floor((width - spacing * (columns - 1)) / columns))
+
+            Repeater {
+              model: root.browseItems
+
+              BrowseCell {
+                required property var modelData
+                required property int index
+                width: browseGrid.cellWidth
+                itemData: modelData
+                cellIndex: index
+              }
+            }
+          }
+        }
+
+        PanelSeparator {
+          foreground: root.foreground
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
+
+          TextField {
+            id: nameField
+            visible: root.selectedPaths.length === 1
+            width: parent.width
+            foreground: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            placeholderText: strings.t("r2drop.namePlaceholder")
+            onTextChanged: root.customName = text
+            onAccepted: root.uploadBrowse(false)
+            Keys.onEscapePressed: function(event) {
+              keyCatcher.forceActiveFocus()
+              event.accepted = true
+            }
+          }
+
+          Button {
+            width: parent.width
+            bordered: true
+            selected: root.selectedPaths.length > 0
+            iconText: "󰅧"
+            text: strings.t("r2drop.uploadCount").arg(Commons.I18n.formatNumber(root.selectedPaths.length))
+            fontSize: Style.font.bodySmall
+            foreground: root.selectedPaths.length > 0 ? root.foreground : root.dim
+            fontFamily: root.fontFamily
+            onClicked: root.uploadBrowse(false)
+          }
+        }
+      }
+
       Rectangle {
         anchors.fill: parent
         radius: Style.cornerRadius
@@ -571,7 +913,7 @@ Panel {
           var paths = root.extractDropPaths(drop)
           if (paths.length > 0) {
             drop.acceptProposedAction()
-            root.uploadFiles(paths)
+            root.uploadFiles(paths, "")
           }
         }
       }
@@ -580,6 +922,111 @@ Panel {
 
   component PlainText: Text {
     textFormat: Text.PlainText
+  }
+
+  component BrowseCell: CursorSurface {
+    id: cell
+    property var itemData: null
+    property int cellIndex: 0
+
+    readonly property string itemPath: itemData ? String(itemData.path || "") : ""
+    readonly property string itemName: itemData && itemData.name ? String(itemData.name) : strings.t("r2drop.untitled")
+    readonly property url fileUrl: itemPath !== "" ? Util.fileUrl(itemPath) : ""
+    readonly property bool isSelected: root.isPathSelected(itemPath)
+
+    hasCursor: root.viewMode === "browse" && root.cursorActive && root.browseIndex === cellIndex
+    current: isSelected
+    bordered: true
+    foreground: root.foreground
+    implicitHeight: cellColumn.implicitHeight + Style.space(10)
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: {
+        root.cursorActive = true
+        root.browseIndex = cell.cellIndex
+      }
+      onClicked: {
+        root.cursorActive = true
+        root.browseIndex = cell.cellIndex
+        root.toggleSelectPath(cell.itemPath)
+      }
+    }
+
+    Column {
+      id: cellColumn
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.margins: Style.space(5)
+      spacing: Style.space(4)
+
+      Rectangle {
+        width: parent.width
+        height: Math.round(width * 0.72)
+        radius: Math.max(2, Math.round(Style.cornerRadius * 0.6))
+        color: Style.hoverFillFor(root.foreground, root.foreground)
+        clip: true
+
+        Image {
+          id: cellThumb
+          anchors.fill: parent
+          source: cell.fileUrl
+          sourceSize.width: 160
+          sourceSize.height: 160
+          fillMode: Image.PreserveAspectCrop
+          asynchronous: true
+          visible: cell.itemPath !== "" && status === Image.Ready
+        }
+
+        PlainText {
+          anchors.centerIn: parent
+          visible: !cellThumb.visible
+          text: "󰋩"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.icon
+        }
+
+        Rectangle {
+          width: Style.space(18)
+          height: Style.space(18)
+          radius: Style.space(9)
+          anchors.top: parent.top
+          anchors.right: parent.right
+          anchors.margins: Style.space(4)
+          color: cell.isSelected ? Commons.Color.accent : Util.alpha(Commons.Color.popups.background, 0.75)
+          border.width: 1
+          border.color: cell.isSelected ? Commons.Color.accent : root.dim
+
+          Behavior on color {
+            ColorAnimation { duration: Style.duration(120) }
+          }
+
+          PlainText {
+            anchors.centerIn: parent
+            visible: cell.isSelected
+            text: "󰄬"
+            color: Commons.Color.popups.background
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+
+      PlainText {
+        width: parent.width
+        text: cell.itemName
+        color: cell.isSelected ? Commons.Color.accent : root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: cell.isSelected
+        elide: Text.ElideRight
+        horizontalAlignment: Text.AlignHCenter
+      }
+    }
   }
 
   component UploadRow: CursorSurface {
@@ -593,7 +1040,7 @@ Panel {
     readonly property string itemThumb: itemData ? String(itemData.thumb || "") : ""
     readonly property url thumbUrl: itemThumb !== "" ? Util.fileUrl(itemThumb) : ""
 
-    hasCursor: root.cursorActive && root.focusSection === "recent" && root.selectedIndex === rowIndex
+    hasCursor: root.viewMode === "main" && root.cursorActive && root.focusSection === "recent" && root.selectedIndex === rowIndex
     foreground: root.foreground
     implicitHeight: Math.max(Style.space(44), rowLayout.implicitHeight + Style.spacing.rowPaddingX)
 
